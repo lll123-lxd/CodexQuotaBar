@@ -25,6 +25,13 @@ struct StatusItemPresentation: Equatable {
     let tooltip: String
     let progress: Double
 
+    static func representativeWeeklyMonitor(from snapshots: [MonitorSnapshot]) -> MonitorSnapshot? {
+        snapshots.min {
+            ($0.snapshot.secondaryQuota.remainingPercent ?? .greatestFiniteMagnitude)
+            < ($1.snapshot.secondaryQuota.remainingPercent ?? .greatestFiniteMagnitude)
+        }
+    }
+
     static func make(
         for snapshot: CodexSnapshot,
         source: QuotaConnectionState,

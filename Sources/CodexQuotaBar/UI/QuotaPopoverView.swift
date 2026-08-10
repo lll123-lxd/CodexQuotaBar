@@ -83,10 +83,10 @@ struct QuotaPopoverView: View {
             }
         }
         .frame(width: 500, height: 760)
-        .background(Color.white.opacity(0.98))
+        .background(Color(nsColor: .windowBackgroundColor))
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(Color.black.opacity(0.10), lineWidth: 1)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
         )
         .onAppear {
             ensureSelectedMonitor()
@@ -127,7 +127,7 @@ struct QuotaPopoverView: View {
             ZStack(alignment: .leading) {
                 if isSelected {
                     Capsule()
-                        .fill(Color.primary)
+                        .fill(Color(nsColor: .separatorColor))
                         .frame(width: 3, height: 36)
                         .offset(x: -11)
                 }
@@ -160,8 +160,12 @@ struct QuotaPopoverView: View {
                 header(for: monitor)
 
                 VStack(spacing: 22) {
-                    quotaLine(title: text.sessionQuotaTitle, quota: monitor.snapshot.primaryQuota)
-                    quotaLine(title: text.weeklyQuotaTitle, quota: monitor.snapshot.secondaryQuota)
+                    quotaLine(
+                        title: text.sevenDayQuotaTitle,
+                        quota: monitor.snapshot.secondaryQuota,
+                        connectionState: store.connectionState(for: monitor.target).label(language: language)
+                    )
+                    quotaLine(title: text.fiveHourQuotaTitle, quota: monitor.snapshot.primaryQuota)
 
                     if subscriptionSettings.isConfigured {
                         quotaLine(
@@ -200,12 +204,12 @@ struct QuotaPopoverView: View {
                     .padding(.vertical, 7)
                     .background(
                         Capsule()
-                            .fill(Color.white)
-                            .shadow(color: .black.opacity(0.08), radius: 8, x: 0, y: 2)
+                            .fill(Color(nsColor: .controlBackgroundColor))
+                            .shadow(color: Color(nsColor: .separatorColor).opacity(0.35), radius: 8, x: 0, y: 2)
                     )
                     .overlay(
                         Capsule()
-                            .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                     )
             }
 
@@ -224,49 +228,54 @@ struct QuotaPopoverView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.white)
-                        .shadow(color: .black.opacity(0.06), radius: 8, x: 0, y: 2)
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color(nsColor: .controlBackgroundColor))
+                        .shadow(color: Color(nsColor: .separatorColor).opacity(0.35), radius: 8, x: 0, y: 2)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)
     }
 
-    private func quotaLine(title: String, quota: QuotaWindow) -> some View {
+    private func quotaLine(title: String, quota: QuotaWindow, connectionState: String? = nil) -> some View {
         quotaLine(
             title: title,
             progress: quota.remainingFraction ?? 0,
             leftLabel: language == .zhHans ? text.remaining(quota.compactRemainingLabel) : "\(quota.compactRemainingLabel) left",
-            rightLabel: text.reset(quota.resetCountdown(from: snapshot.refreshedAt, language: language))
+            rightLabel: text.reset(quota.resetCountdown(from: snapshot.refreshedAt, language: language)),
+            connectionState: connectionState
         )
     }
 
-    private func quotaLine(title: String, progress: Double, leftLabel: String, rightLabel: String) -> some View {
+    private func quotaLine(
+        title: String,
+        progress: Double,
+        leftLabel: String,
+        rightLabel: String,
+        connectionState: String? = nil
+    ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.system(size: 20, weight: .bold))
                     .foregroundStyle(.primary)
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 9, height: 9)
+                if let connectionState {
+                    Text(connectionState)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
             }
 
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     Capsule()
-                        .fill(Color.black.opacity(0.045))
+                        .fill(Color(nsColor: .separatorColor).opacity(0.35))
                     Capsule()
-                        .fill(Color(red: 0.04, green: 0.07, blue: 0.12))
+                        .fill(Color(nsColor: .systemBlue))
                         .frame(width: max(0, proxy.size.width * min(max(progress, 0), 1)))
-                    Rectangle()
-                        .fill(Color.white.opacity(0.25))
-                        .frame(width: 2)
-                        .offset(x: max(0, proxy.size.width * 0.94))
                 }
             }
             .frame(height: 16)
@@ -290,9 +299,9 @@ struct QuotaPopoverView: View {
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     Capsule()
-                        .fill(Color.black.opacity(0.045))
+                        .fill(Color(nsColor: .separatorColor).opacity(0.35))
                     Capsule()
-                        .fill(Color(red: 0.04, green: 0.07, blue: 0.12))
+                        .fill(Color(nsColor: .systemBlue))
                         .frame(width: max(0, proxy.size.width * savingsProgress))
                 }
             }

@@ -101,26 +101,29 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         }
 
         let snapshot = monitor?.snapshot ?? .empty
-        let title = snapshot.primaryQuota.compactRemainingLabel
+        let source = monitor.map { store.connectionState(for: $0.target) } ?? .logs
+        let presentation = StatusItemPresentation.make(
+            for: snapshot,
+            source: source,
+            now: Date(),
+            language: AppPreferences.language
+        )
+        let title = presentation.title
         let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: NSColor.labelColor,
         ]
 
-        button.image = RingImageRenderer.makeStatusImage(for: snapshot)
+        button.image = RingImageRenderer.makeStatusImage(progress: presentation.progress)
         button.font = font
         button.title = title
         button.attributedTitle = NSAttributedString(string: title, attributes: attributes)
         button.imagePosition = .imageLeft
         button.imageScaling = .scaleProportionallyDown
-        if let monitor {
-            button.toolTip = "\(monitor.target.name)\n\(snapshot.tooltipText(language: AppPreferences.language))"
-        } else {
-            button.toolTip = snapshot.tooltipText(language: AppPreferences.language)
-        }
+        button.toolTip = monitor.map { "\($0.target.name)\n\(presentation.tooltip)" } ?? presentation.tooltip
         forceStatusItemRedraw(button: button, title: title, attributes: attributes)
-        writeDebugStatus(monitor: monitor, snapshot: snapshot, statusTitle: title)
+        writeDebugStatus(monitor: monitor, snapshot: snapshot, source: source, statusTitle: title)
     }
 
     private func applyLocalizedChrome() {
@@ -129,11 +132,7 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     }
 
     private func representativeStatusMonitor(from snapshots: [MonitorSnapshot]) -> MonitorSnapshot? {
-        snapshots.min { lhs, rhs in
-            let lhsRemaining = lhs.snapshot.primaryQuota.remainingPercent ?? Double.greatestFiniteMagnitude
-            let rhsRemaining = rhs.snapshot.primaryQuota.remainingPercent ?? Double.greatestFiniteMagnitude
-            return lhsRemaining < rhsRemaining
-        }
+        StatusItemPresentation.representativeWeeklyMonitor(from: snapshots)
     }
 
     private func forceStatusItemRedraw(
@@ -151,7 +150,12 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
         button.window?.displayIfNeeded()
     }
 
-    private func writeDebugStatus(monitor: MonitorSnapshot?, snapshot: CodexSnapshot, statusTitle: String) {
+    private func writeDebugStatus(
+        monitor: MonitorSnapshot?,
+        snapshot: CodexSnapshot,
+        source: QuotaConnectionState,
+        statusTitle: String
+    ) {
         let directory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/CodexQuotaBar", isDirectory: true)
         let url = directory.appendingPathComponent("debug-status.json")
@@ -162,8 +166,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
             "appPath": Bundle.main.bundlePath,
             "statusTitle": statusTitle,
             "monitorName": monitor?.target.name ?? NSNull(),
-            "remainingPercent": snapshot.primaryQuota.remainingPercent ?? NSNull(),
-            "usedPercent": snapshot.primaryQuota.usedPercent ?? NSNull(),
+            "source": source.label(language: AppPreferences.language),
+            "remainingPercent": snapshot.secondaryQuota.remainingPercent ?? NSNull(),
+            "usedPercent": snapshot.secondaryQuota.usedPercent ?? NSNull(),
+            "resetAt": snapshot.secondaryQuota.resetAt.map { formatter.string(from: $0) } ?? NSNull(),
             "latestEventAt": snapshot.latestEventAt.map { formatter.string(from: $0) } ?? NSNull(),
             "refreshedAt": formatter.string(from: snapshot.refreshedAt),
         ]

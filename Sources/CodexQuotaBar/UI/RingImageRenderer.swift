@@ -1,7 +1,7 @@
 import AppKit
 
 enum RingImageRenderer {
-    static func makeStatusImage(for snapshot: CodexSnapshot) -> NSImage {
+    static func makeStatusImage(progress: Double) -> NSImage {
         let size = NSSize(width: 17, height: 17)
         let image = NSImage(size: size)
         image.lockFocus()
@@ -14,21 +14,21 @@ enum RingImageRenderer {
         let rect = CGRect(x: 1.7, y: 1.7, width: 13.6, height: 13.6)
         let center = CGPoint(x: rect.midX, y: rect.midY)
         let radius = rect.width / 2
-        let color = statusColor(for: snapshot.primaryQuota.remainingPercent)
+        let progress = min(max(progress, 0), 1)
 
         context.setLineWidth(2.15)
         context.setLineCap(.round)
         context.setStrokeColor(NSColor.labelColor.withAlphaComponent(0.16).cgColor)
         context.strokeEllipse(in: rect)
 
-        if let fraction = snapshot.primaryQuota.remainingFraction, fraction > 0 {
+        if progress > 0 {
             let startAngle = CGFloat.pi / 2
-            let endAngle = startAngle - (CGFloat.pi * 2 * CGFloat(fraction))
+            let endAngle = startAngle - (CGFloat.pi * 2 * CGFloat(progress))
             let arc = CGMutablePath()
             arc.addArc(center: center, radius: radius, startAngle: startAngle, endAngle: endAngle, clockwise: true)
 
             context.addPath(arc)
-            context.setStrokeColor(color.cgColor)
+            context.setStrokeColor(NSColor.systemBlue.cgColor)
             context.strokePath()
         }
 
@@ -39,20 +39,5 @@ enum RingImageRenderer {
         image.unlockFocus()
         image.isTemplate = false
         return image
-    }
-
-    static func statusColor(for remainingPercent: Double?) -> NSColor {
-        guard let remainingPercent else {
-            return NSColor.systemGray
-        }
-
-        switch remainingPercent {
-        case 60...:
-            return NSColor.systemGreen
-        case 25..<60:
-            return NSColor.systemOrange
-        default:
-            return NSColor.systemRed
-        }
     }
 }
