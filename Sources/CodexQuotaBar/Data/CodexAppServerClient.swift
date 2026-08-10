@@ -76,6 +76,8 @@ actor CodexAppServerClient: OfficialRateLimitClient {
     private var transport: (any AppServerTransport)?
     private var readerTask: Task<Void, Never>?
     private var connectionTask: Task<Void, Error>?
+    private var reconnectTask: Task<Void, Never>?
+    private var backoffTasks: [UUID: Task<Void, Error>] = [:]
     private var connectionGeneration: UUID?
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
     private var nextID = 1
@@ -105,6 +107,7 @@ actor CodexAppServerClient: OfficialRateLimitClient {
     func readRateLimits() async throws -> OfficialRateLimits {
         var attempt = 0
         while !stopped {
+            var requestGeneration: UUID?
             do {
                 if transport == nil {
                     let state: QuotaConnectionState = attempt == 0
@@ -113,6 +116,7 @@ actor CodexAppServerClient: OfficialRateLimitClient {
                     eventContinuation.yield(.stateChanged(state))
                 }
                 try await ensureConnected()
+                requestGeneration = connectionGeneration
                 let response: OfficialRateLimitsResponse = try await request(
                     "account/rateLimits/read",
                     params: [:]
@@ -125,14 +129,14 @@ actor CodexAppServerClient: OfficialRateLimitClient {
                     attempt: attempt,
                     message: "Server overloaded"
                 )))
-                try await sleep(reconnectDelay(for: attempt))
+                try await waitForReconnectBackoff(reconnectDelay(for: attempt))
             } catch is CancellationError {
                 throw CancellationError()
             } catch CodexAppServerClientError.stopped {
                 throw CodexAppServerClientError.stopped
             } catch {
                 attempt += 1
-                await invalidateConnection(error)
+                await invalidateConnection(error, generation: requestGeneration)
                 guard !stopped else {
                     throw CodexAppServerClientError.stopped
                 }
@@ -140,7 +144,7 @@ actor CodexAppServerClient: OfficialRateLimitClient {
                     attempt: attempt,
                     message: error.localizedDescription
                 )))
-                try await sleep(reconnectDelay(for: attempt))
+                try await waitForReconnectBackoff(reconnectDelay(for: attempt))
             }
         }
         throw CodexAppServerClientError.stopped
@@ -152,12 +156,27 @@ actor CodexAppServerClient: OfficialRateLimitClient {
         let initializer = connectionTask
         connectionTask = nil
         initializer?.cancel()
+        let reconnect = reconnectTask
+        reconnectTask = nil
+        reconnect?.cancel()
+        let backoffs = Array(backoffTasks.values)
+        backoffTasks.removeAll()
+        backoffs.forEach { $0.cancel() }
         await invalidateConnection(CodexAppServerClientError.stopped)
         eventContinuation.finish()
     }
 
     private func reconnectDelay(for attempt: Int) -> TimeInterval {
         ReconnectBackoff.delay(for: attempt, jitter: jitter(0.9...1.1))
+    }
+
+    private func waitForReconnectBackoff(_ delay: TimeInterval) async throws {
+        let identifier = UUID()
+        let sleeper = sleep
+        let task = Task { try await sleeper(delay) }
+        backoffTasks[identifier] = task
+        defer { backoffTasks[identifier] = nil }
+        try await task.value
     }
 
     private func ensureConnected() async throws {
@@ -354,6 +373,43 @@ actor CodexAppServerClient: OfficialRateLimitClient {
             CodexAppServerClientError.disconnected,
             generation: generation
         )
+        startReconnectSupervisor()
+    }
+
+    private func startReconnectSupervisor() {
+        guard !stopped, reconnectTask == nil else { return }
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            await self.superviseReconnect()
+        }
+    }
+
+    private func superviseReconnect() async {
+        defer { reconnectTask = nil }
+        var attempt = 0
+        while !stopped, transport == nil {
+            do {
+                try await ensureConnected()
+                return
+            } catch is CancellationError {
+                return
+            } catch CodexAppServerClientError.stopped {
+                return
+            } catch {
+                attempt += 1
+                await invalidateConnection(error)
+                guard !stopped else { return }
+                eventContinuation.yield(.stateChanged(.reconnecting(
+                    attempt: attempt,
+                    message: error.localizedDescription
+                )))
+                do {
+                    try await waitForReconnectBackoff(reconnectDelay(for: attempt))
+                } catch {
+                    return
+                }
+            }
+        }
     }
 
     private func invalidateConnection(_ error: Error, generation: UUID? = nil) async {
