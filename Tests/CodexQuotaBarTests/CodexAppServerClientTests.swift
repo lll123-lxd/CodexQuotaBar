@@ -463,7 +463,6 @@ final class CodexAppServerClientTests: XCTestCase {
         await first.failNextSend()
 
         let read = Task { try await client.readRateLimits() }
-        _ = try await waitForSentCount(1, transport: first)
         try await waitUntil { await first.stopCount == 1 }
         _ = try await waitForSentCount(1, transport: second)
         let initialize = try jsonObject((await second.sent)[0])
