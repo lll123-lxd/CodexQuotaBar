@@ -2,13 +2,25 @@ name: macOS
 
 on:
   push:
-    branches: [feature/official-quota-sync-blue]
   pull_request:
 
 jobs:
-  test:
+  test-and-build:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
-      - run: swift --version
-      - run: swift test
+      - name: Select Swift
+        run: swift --version
+      - name: Test, build, and ad-hoc sign
+        run: ./scripts/build_app.sh
+      - name: Verify bundle
+        run: |
+          codesign --verify --deep --strict --verbose=2 dist/CodexQuotaBar.app
+          plutil -p dist/CodexQuotaBar.app/Contents/Info.plist
+      - name: Package app bundle
+        run: ditto -c -k --keepParent dist/CodexQuotaBar.app dist/CodexQuotaBar.app.zip
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexQuotaBar-macOS
+          path: dist/CodexQuotaBar.app.zip

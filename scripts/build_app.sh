@@ -10,13 +10,13 @@ APP_DIR="$DIST_DIR/$APP_NAME"
 MACOS_DIR="$APP_DIR/Contents/MacOS"
 
 cd "$ROOT_DIR"
+swift test
 swift build -c release
 
+rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 cp "$BUILD_DIR/CodexQuotaBar" "$MACOS_DIR/CodexQuotaBar"
 chmod +x "$MACOS_DIR/CodexQuotaBar"
-
-/usr/bin/plutil -replace CFBundleDevelopmentRegion -string en "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
 
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -47,4 +47,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-echo "Built $APP_DIR"
+SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+/usr/bin/codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR"
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+
+echo "Built and verified $APP_DIR"
