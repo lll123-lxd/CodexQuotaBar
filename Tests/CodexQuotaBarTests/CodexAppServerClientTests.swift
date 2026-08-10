@@ -205,11 +205,296 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1.5)
         assertProcessDoesNotExist(parentPID)
     }
+
+    func testHandshakeReadsOfficialLimitsAndMapsUpdatedNotification() async throws {
+        let transport = FakeAppServerTransport()
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { transport },
+            timeoutSeconds: 0.2,
+            sleep: { _ in },
+            jitter: { _ in 1 },
+            now: { Date(timeIntervalSince1970: 1_000) }
+        )
+        let read = Task { try await client.readRateLimits() }
+
+        var sent = try await waitForSentCount(1, transport: transport)
+        let initialize = try jsonObject(sent[0])
+        XCTAssertEqual(initialize["method"] as? String, "initialize")
+        let clientInfo = (initialize["params"] as? [String: Any])?["clientInfo"] as? [String: Any]
+        XCTAssertEqual(clientInfo?["name"] as? String, "codex-quota-bar")
+        XCTAssertEqual(clientInfo?["title"] as? String, "CodexQuotaBar")
+        XCTAssertEqual(clientInfo?["version"] as? String, "1.0.0")
+        let initializeID = try rpcID(initialize)
+        await transport.emit("{\"id\":\(initializeID),\"result\":{}}")
+
+        sent = try await waitForSentCount(3, transport: transport)
+        XCTAssertEqual(try jsonObject(sent[1])["method"] as? String, "initialized")
+        let rateRequest = try jsonObject(sent[2])
+        XCTAssertEqual(rateRequest["method"] as? String, "account/rateLimits/read")
+        let rateID = try rpcID(rateRequest)
+        await transport.emit("{\"id\":\(rateID),\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":20,\"windowDurationMins\":300,\"resetsAt\":2000},\"secondary\":{\"usedPercent\":14,\"windowDurationMins\":10080,\"resetsAt\":9000},\"planType\":\"plus\"}}}")
+
+        let limits = try await value(of: read)
+        XCTAssertEqual(limits.secondary?.remainingFraction ?? -1, 0.86, accuracy: 0.000_001)
+        let startCount = await transport.startCount
+        XCTAssertEqual(startCount, 1)
+
+        await transport.emit("{\"method\":\"account/rateLimits/updated\",\"params\":{\"rateLimits\":{\"secondary\":{\"usedPercent\":15}}}}")
+        let foundUpdate = try await waitForEvent(.rateLimitsChanged, in: client.events)
+        XCTAssertTrue(foundUpdate)
+        try await stopClient(client)
+    }
+
+    func testRequestTimeoutAndReconnectBackoffScheduleAreFixedAndBounded() {
+        XCTAssertEqual(CodexAppServerClient.requestTimeoutSeconds, 20)
+        XCTAssertEqual(
+            (1...7).map { ReconnectBackoff.delay(for: $0, jitter: 1) },
+            [1, 2, 4, 8, 16, 30, 30]
+        )
+        XCTAssertEqual(ReconnectBackoff.delay(for: 1, jitter: 0.1), 0.9, accuracy: 0.000_001)
+        XCTAssertEqual(ReconnectBackoff.delay(for: 1, jitter: 9), 1.1, accuracy: 0.000_001)
+        XCTAssertEqual(ReconnectBackoff.delay(for: 6, jitter: 1.1), 30, accuracy: 0.000_001)
+        XCTAssertEqual(ReconnectBackoff.delay(for: 99, jitter: 1), 30, accuracy: 0.000_001)
+    }
+
+    func testTimeoutStopsOldTransportAndReconnects() async throws {
+        let first = FakeAppServerTransport()
+        let second = FakeAppServerTransport()
+        let queue = LockedTransportQueue([first, second])
+        let delays = LockedDelays()
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { try queue.next() },
+            timeoutSeconds: 0.01,
+            sleep: { delays.append($0) },
+            jitter: { _ in 1 }
+        )
+        let read = Task { try await client.readRateLimits() }
+
+        _ = try await waitForSentCount(1, transport: first)
+        try await waitUntil { await first.stopCount == 1 }
+        var sent = try await waitForSentCount(1, transport: second)
+        var object = try jsonObject(sent[0])
+        await second.emit("{\"id\":\(try rpcID(object)),\"result\":{}}")
+        sent = try await waitForSentCount(3, transport: second)
+        object = try jsonObject(sent[2])
+        await second.emit("{\"id\":\(try rpcID(object)),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
+
+        _ = try await value(of: read)
+        XCTAssertEqual(delays.values, [1])
+        XCTAssertEqual(queue.makeCount, 2)
+        try await stopClient(client)
+    }
+
+    func testOverloadBacksOffWithoutRestartingHealthyTransport() async throws {
+        let transport = FakeAppServerTransport()
+        let delays = LockedDelays()
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { transport },
+            timeoutSeconds: 0.2,
+            sleep: { delays.append($0) },
+            jitter: { _ in 1 }
+        )
+        let read = Task { try await client.readRateLimits() }
+        let firstRateID = try await completeHandshakeAndReturnRateRequestID(transport)
+        await transport.emit("{\"id\":\(firstRateID),\"error\":{\"code\":-32001,\"message\":\"Server overloaded; retry later.\"}}")
+
+        let sent = try await waitForSentCount(4, transport: transport)
+        let secondRate = try jsonObject(sent[3])
+        XCTAssertEqual(secondRate["method"] as? String, "account/rateLimits/read")
+        await transport.emit("{\"id\":\(try rpcID(secondRate)),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
+
+        _ = try await value(of: read)
+        XCTAssertEqual(delays.values, [1])
+        let stopCount = await transport.stopCount
+        XCTAssertEqual(stopCount, 0)
+        try await stopClient(client)
+    }
+
+    func testMalformedMessageStopsOldTransportAndDoesNotLeakPendingReadAcrossReconnect() async throws {
+        let first = FakeAppServerTransport()
+        let second = FakeAppServerTransport()
+        let queue = LockedTransportQueue([first, second])
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { try queue.next() },
+            timeoutSeconds: 0.2,
+            sleep: { _ in },
+            jitter: { _ in 1 }
+        )
+        let read = Task { try await client.readRateLimits() }
+
+        _ = try await waitForSentCount(1, transport: first)
+        await first.emit("{bad json")
+        try await waitUntil { await first.stopCount == 1 }
+
+        let rateID = try await completeHandshakeAndReturnRateRequestID(second)
+        await second.emit("{\"id\":\(rateID),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
+        _ = try await value(of: read)
+        XCTAssertEqual(queue.makeCount, 2)
+        try await stopClient(client)
+    }
 }
 
 private enum ProcessTransportTestError: Error {
     case timedOut(String)
     case invalidPID(String)
+}
+
+private enum RPCClientTestError: Error {
+    case timedOut(String)
+    case invalidRPCID
+    case noTransportsRemaining
+}
+
+private final class LockedTransportQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var transports: [any AppServerTransport]
+    private var count = 0
+
+    init(_ transports: [any AppServerTransport]) {
+        self.transports = transports
+    }
+
+    var makeCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    func next() throws -> any AppServerTransport {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !transports.isEmpty else {
+            throw RPCClientTestError.noTransportsRemaining
+        }
+        count += 1
+        return transports.removeFirst()
+    }
+}
+
+private final class LockedDelays: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [TimeInterval] = []
+
+    var values: [TimeInterval] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    func append(_ value: TimeInterval) {
+        lock.lock()
+        storage.append(value)
+        lock.unlock()
+    }
+}
+
+private func jsonObject(_ data: Data) throws -> [String: Any] {
+    try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+}
+
+private func rpcID(_ object: [String: Any]) throws -> Int {
+    guard let id = object["id"] as? NSNumber else {
+        throw RPCClientTestError.invalidRPCID
+    }
+    return id.intValue
+}
+
+private func waitForSentCount(
+    _ count: Int,
+    transport: FakeAppServerTransport,
+    timeout: Duration = .seconds(1)
+) async throws -> [Data] {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        let sent = await transport.sent
+        if sent.count >= count {
+            return sent
+        }
+        try await clock.sleep(for: .milliseconds(10))
+    }
+    throw RPCClientTestError.timedOut("waiting for \(count) app-server messages")
+}
+
+private func waitUntil(
+    timeout: Duration = .seconds(1),
+    _ predicate: @escaping @Sendable () async -> Bool
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if await predicate() {
+            return
+        }
+        try await clock.sleep(for: .milliseconds(10))
+    }
+    throw RPCClientTestError.timedOut("waiting for asynchronous condition")
+}
+
+private func completeHandshakeAndReturnRateRequestID(
+    _ transport: FakeAppServerTransport
+) async throws -> Int {
+    var sent = try await waitForSentCount(1, transport: transport)
+    var object = try jsonObject(sent[0])
+    await transport.emit("{\"id\":\(try rpcID(object)),\"result\":{}}")
+    sent = try await waitForSentCount(3, transport: transport)
+    object = try jsonObject(sent[2])
+    XCTAssertEqual(object["method"] as? String, "account/rateLimits/read")
+    return try rpcID(object)
+}
+
+private func value<Success: Sendable>(
+    of task: Task<Success, Error>,
+    timeout: Duration = .seconds(1)
+) async throws -> Success {
+    do {
+        return try await withThrowingTaskGroup(of: Success.self) { group in
+            group.addTask { try await task.value }
+            group.addTask {
+                try await ContinuousClock().sleep(for: timeout)
+                throw RPCClientTestError.timedOut("waiting for RPC task")
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw RPCClientTestError.timedOut("waiting for RPC task result")
+            }
+            return result
+        }
+    } catch {
+        task.cancel()
+        throw error
+    }
+}
+
+private func waitForEvent(
+    _ expected: CodexAppServerEvent,
+    in events: AsyncStream<CodexAppServerEvent>,
+    timeout: Duration = .seconds(1)
+) async throws -> Bool {
+    try await withThrowingTaskGroup(of: Bool.self) { group in
+        group.addTask {
+            for await event in events {
+                if event == expected {
+                    return true
+                }
+            }
+            return false
+        }
+        group.addTask {
+            try await ContinuousClock().sleep(for: timeout)
+            throw RPCClientTestError.timedOut("waiting for app-server event")
+        }
+        defer { group.cancelAll() }
+        guard let found = try await group.next() else {
+            throw RPCClientTestError.timedOut("waiting for app-server event result")
+        }
+        return found
+    }
+}
+
+private func stopClient(_ client: CodexAppServerClient) async throws {
+    let stop = Task<Void, Never> { await client.stop() }
+    try await waitForTasks([stop], timeout: .seconds(1))
 }
 
 private func makeTemporaryDirectory() throws -> URL {
