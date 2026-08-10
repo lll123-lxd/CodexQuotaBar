@@ -136,7 +136,9 @@ actor CodexAppServerClient: OfficialRateLimitClient {
                 throw CodexAppServerClientError.stopped
             } catch {
                 attempt += 1
-                await invalidateConnection(error, generation: requestGeneration)
+                if let requestGeneration {
+                    await invalidateConnection(error, generation: requestGeneration)
+                }
                 guard !stopped else {
                     throw CodexAppServerClientError.stopped
                 }
@@ -385,7 +387,12 @@ actor CodexAppServerClient: OfficialRateLimitClient {
     }
 
     private func superviseReconnect() async {
-        defer { reconnectTask = nil }
+        defer {
+            reconnectTask = nil
+            if !stopped, transport == nil {
+                startReconnectSupervisor()
+            }
+        }
         var attempt = 0
         while !stopped, transport == nil {
             do {
@@ -397,7 +404,6 @@ actor CodexAppServerClient: OfficialRateLimitClient {
                 return
             } catch {
                 attempt += 1
-                await invalidateConnection(error)
                 guard !stopped else { return }
                 eventContinuation.yield(.stateChanged(.reconnecting(
                     attempt: attempt,
