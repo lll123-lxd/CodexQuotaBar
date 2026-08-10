@@ -2,10 +2,6 @@
 
 CodexQuotaBar is a macOS menu-bar app that shows your remaining weekly Codex quota and reset time. It reads official quota values from a local `codex app-server`; local Codex session logs still provide token totals and the fallback when the app-server is unavailable.
 
-<p>
-  <img src="docs/assets/codexquotabar-preview.png" width="100%" alt="CodexQuotaBar bilingual product preview">
-</p>
-
 ## Requirements
 
 - macOS 13 or newer.

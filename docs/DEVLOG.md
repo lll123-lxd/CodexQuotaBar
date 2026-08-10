@@ -5,7 +5,7 @@
 - Completed: updated the release build path to run tests, recreate only `dist/CodexQuotaBar.app`, sign with `CODE_SIGN_IDENTITY` or ad-hoc `-`, and strictly verify the bundle.
 - Completed: updated the existing macOS 26 workflow to run that exact build path, verify the bundle and plist, package the `.app` as a ZIP, and publish it as a workflow artifact.
 - Completed: aligned README, architecture, and privacy documentation with local app-server quota reads, log fallback/token totals, reconnect behavior, launch-at-login default, and diagnostic fields.
-- Tests/checks run: static review pending final macOS CI execution; no macOS bundle, codesign, or XCTest PASS is recorded here before CI evidence exists.
+- Tests/checks run: GitHub Actions run `31369204209` passed the full XCTest suite, release build, ad-hoc codesign verification, plist inspection, ZIP packaging, and artifact upload on `macos-26`.
 
 ## 2026-05-07 21:39 CST
 
