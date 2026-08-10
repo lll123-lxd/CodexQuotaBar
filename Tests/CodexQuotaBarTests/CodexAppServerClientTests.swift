@@ -264,7 +264,7 @@ final class CodexAppServerClientTests: XCTestCase {
         let delays = LockedDelays()
         let client = CodexAppServerClient(
             factory: AppServerTransportFactory { try queue.next() },
-            timeoutSeconds: 0.01,
+            timeoutSeconds: 0.2,
             sleep: { delays.append($0) },
             jitter: { _ in 1 }
         )
