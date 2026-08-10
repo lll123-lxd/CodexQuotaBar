@@ -38,9 +38,53 @@ private actor FakeOfficialRateLimitClient: OfficialRateLimitClient {
 
     func stop() {
         stopCount += 1
-        reads.forEach { $0.resume(throwing: CancellationError()) }
-        reads.removeAll()
-        eventContinuation.finish()
+    }
+}
+
+private final class SequencedSnapshotLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var loadCount = 0
+
+    func load(target: MonitorTarget, now: Date) -> CodexSnapshot {
+        lock.lock()
+        loadCount += 1
+        let primaryUsed = loadCount == 1 ? 50.0 : 55.0
+        lock.unlock()
+        return SnapshotFixtures.make(
+            now: now,
+            primaryUsed: primaryUsed,
+            secondaryUsed: 60,
+            secondaryResetAt: nil
+        )
+    }
+}
+
+private final class BlockingSnapshotLoader: @unchecked Sendable {
+    private let lock = NSLock()
+    private let unblockSignal = DispatchSemaphore(value: 0)
+    private var didStart = false
+
+    func load(target: MonitorTarget, now: Date) -> CodexSnapshot {
+        lock.lock()
+        didStart = true
+        lock.unlock()
+        unblockSignal.wait()
+        return SnapshotFixtures.make(
+            now: now,
+            primaryUsed: 50,
+            secondaryUsed: 50,
+            secondaryResetAt: nil
+        )
+    }
+
+    func hasStarted() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didStart
+    }
+
+    func unblock() {
+        unblockSignal.signal()
     }
 }
 
@@ -96,8 +140,10 @@ final class CodexUsageStoreTests: XCTestCase {
         store.start()
         try await waitUntil { await client.readCount == 1 && store.monitorSnapshots.count == 1 }
 
+        store.refreshNow()
         await client.fail(StoreTestError.failed)
 
+        try await waitUntil { await client.readCount == 2 }
         try await waitUntil { store.connectionState == .logs }
         XCTAssertEqual(store.monitorSnapshots[0].snapshot.secondaryQuota.remainingPercent, 50)
         store.stop()
@@ -148,6 +194,82 @@ final class CodexUsageStoreTests: XCTestCase {
         store.stop()
 
         try await waitUntil { await client.stopCount == 1 }
+    }
+
+    func testStopIsTerminalAndIdempotent() async throws {
+        let client = FakeOfficialRateLimitClient()
+        let store = makeStore(client: client, targets: [makeTarget(id: "default-codex")])
+        store.start()
+        try await waitUntil { await client.readCount == 1 }
+
+        store.stop()
+        try await waitUntil { await client.stopCount == 1 }
+        store.start()
+        store.refreshNow()
+        for _ in 0..<10 { await Task.yield() }
+
+        let readCount = await client.readCount
+        XCTAssertEqual(readCount, 1)
+        store.stop()
+        let stopCount = await client.stopCount
+        XCTAssertEqual(stopCount, 1)
+    }
+
+    func testOfficialOverlaysAlwaysUseRawLogSnapshots() async throws {
+        let now = fixedNow
+        let client = FakeOfficialRateLimitClient()
+        let loader = SequencedSnapshotLoader()
+        let store = CodexUsageStore(
+            officialClient: client,
+            snapshotLoader: { target, date in loader.load(target: target, now: date) },
+            monitorTargets: { [makeTarget(id: "default-codex")] },
+            now: { now }
+        )
+        store.start()
+        try await waitUntil { await client.readCount == 1 && store.monitorSnapshots.count == 1 }
+
+        await client.succeed(officialLimits())
+        try await waitUntil { store.monitorSnapshots[0].snapshot.primaryQuota.usedPercent == 20 }
+        await client.emit(.rateLimitsChanged)
+        try await waitUntil { await client.readCount == 2 }
+        await client.succeed(OfficialRateLimits(
+            primary: nil,
+            secondary: OfficialRateLimitWindow(usedPercent: 30, windowDurationMins: 10_080, resetsAt: 3_000_000),
+            planType: "plus"
+        ))
+
+        try await waitUntil { store.monitorSnapshots[0].snapshot.secondaryQuota.usedPercent == 30 }
+        XCTAssertEqual(store.monitorSnapshots[0].snapshot.primaryQuota.usedPercent, 50)
+        store.refreshNow()
+        try await waitUntil { store.monitorSnapshots[0].snapshot.primaryQuota.usedPercent == 55 }
+        XCTAssertEqual(store.monitorSnapshots[0].snapshot.secondaryQuota.usedPercent, 30)
+        store.stop()
+    }
+
+    func testLateLogReadAndEventDoNotWriteAfterStop() async throws {
+        let now = fixedNow
+        let client = FakeOfficialRateLimitClient()
+        let loader = BlockingSnapshotLoader()
+        let store = CodexUsageStore(
+            officialClient: client,
+            snapshotLoader: { target, date in loader.load(target: target, now: date) },
+            monitorTargets: { [makeTarget(id: "default-codex")] },
+            now: { now }
+        )
+        store.start()
+        try await waitUntil {
+            let readCount = await client.readCount
+            return loader.hasStarted() && readCount == 1
+        }
+
+        store.stop()
+        await client.succeed(officialLimits())
+        await client.emit(.stateChanged(.live(updatedAt: now)))
+        loader.unblock()
+        for _ in 0..<10 { await Task.yield() }
+
+        XCTAssertTrue(store.monitorSnapshots.isEmpty)
+        XCTAssertEqual(store.connectionState, .logs)
     }
 
     private let fixedNow = Date(timeIntervalSince1970: 1_000_000)
