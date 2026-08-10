@@ -46,7 +46,7 @@
 
 新增一个独立客户端，负责：
 
-1. 启动本机 `codex app-server --stdio` 子进程。
+1. 启动本机 `codex app-server` 子进程；该命令默认使用 stdio。
 2. 通过换行分隔 JSON 与 app-server 通信。
 3. 发送一次 `initialize` 请求并发送 `initialized` 通知。
 4. 调用 `account/rateLimits/read`。
@@ -215,4 +215,3 @@ macOS 验证：
 - 日志 token 统计、多监控器、打开立即刷新和设置能力不回归。
 - 开机启动可由用户控制。
 - 自动化测试、release 构建、签名校验和 macOS 手工验证均有证据。
-
