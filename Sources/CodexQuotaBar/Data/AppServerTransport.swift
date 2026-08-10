@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 protocol AppServerTransport: Sendable {
@@ -60,8 +61,12 @@ actor ProcessAppServerTransport: AppServerTransport {
     private var inputHandle: FileHandle?
     private var outputHandle: FileHandle?
     private var errorHandle: FileHandle?
-    private var buffer = Data()
-    private var streamFinished = false
+    private var stdoutTask: Task<Void, Never>?
+    private var stderrTask: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
+    private var started = false
+    private var cleanupComplete = false
+    private var exitCode: Int32?
 
     init(executableURL: URL) {
         self.executableURL = executableURL
@@ -71,40 +76,60 @@ actor ProcessAppServerTransport: AppServerTransport {
     }
 
     func start() async throws {
-        guard process == nil else { return }
+        if let process {
+            if process.isRunning {
+                return
+            }
+            throw AppServerTransportError.processExited(process.terminationStatus)
+        }
+        if started {
+            throw AppServerTransportError.processExited(exitCode ?? -1)
+        }
+        guard !cleanupComplete else {
+            throw AppServerTransportError.notRunning
+        }
 
         let process = Process()
         let inputPipe = Pipe()
         let outputPipe = Pipe()
         let errorPipe = Pipe()
+        let inputHandle = inputPipe.fileHandleForWriting
+        let outputHandle = outputPipe.fileHandleForReading
+        let errorHandle = errorPipe.fileHandleForReading
         process.executableURL = executableURL
         process.arguments = ["app-server"]
         process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
-
-        inputHandle = inputPipe.fileHandleForWriting
-        outputHandle = outputPipe.fileHandleForReading
-        errorHandle = errorPipe.fileHandleForReading
-        self.process = process
-
-        outputHandle?.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            Task { await self?.consume(data) }
-        }
-        errorHandle?.readabilityHandler = { handle in
-            _ = handle.availableData
-        }
         process.terminationHandler = { [weak self] terminatedProcess in
+            let pid = terminatedProcess.processIdentifier
             let code = terminatedProcess.terminationStatus
-            Task { await self?.didTerminate(code: code) }
+            Task { await self?.didTerminate(pid: pid, code: code) }
         }
+
+        self.process = process
+        self.inputHandle = inputHandle
+        self.outputHandle = outputHandle
+        self.errorHandle = errorHandle
+        started = true
 
         do {
             try process.run()
         } catch {
-            await stop()
+            process.terminationHandler = nil
+            self.process = nil
+            closeHandles()
+            cleanupComplete = true
+            exitCode = -1
+            continuation.finish()
             throw error
+        }
+
+        stdoutTask = Task { [continuation, outputHandle] in
+            await Self.readStdout(from: outputHandle, continuation: continuation)
+        }
+        stderrTask = Task { [errorHandle] in
+            await Self.drainStderr(from: errorHandle)
         }
     }
 
@@ -118,61 +143,141 @@ actor ProcessAppServerTransport: AppServerTransport {
     }
 
     func stop() async {
-        outputHandle?.readabilityHandler = nil
-        errorHandle?.readabilityHandler = nil
-        process?.terminationHandler = nil
-        if process?.isRunning == true {
-            process?.terminate()
+        if cleanupComplete {
+            return
         }
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+
+        let task = Task { [weak self] in
+            await self?.performStop()
+        }
+        shutdownTask = task
+        await task.value
+    }
+
+    private func performStop() async {
+        guard let process else {
+            continuation.finish()
+            await finishIO()
+            cleanupComplete = true
+            return
+        }
+
+        let pid = process.processIdentifier
+        if process.isRunning {
+            process.terminate()
+        }
+
+        var exited = await waitForExit(process, timeout: .seconds(2))
+        if !exited, process.isRunning {
+            _ = Darwin.kill(pid, SIGKILL)
+            exited = await waitForExit(process, timeout: .seconds(2))
+        }
+        if !exited, process.isRunning {
+            _ = Darwin.kill(pid, SIGKILL)
+            exited = await waitForExit(process, timeout: .seconds(1))
+        }
+
+        process.terminationHandler = nil
+        if self.process?.processIdentifier == pid {
+            self.process = nil
+        }
+        if exited {
+            exitCode = process.terminationStatus
+            await finishIO()
+        } else {
+            forceCloseIO()
+        }
+        cleanupComplete = true
+    }
+
+    private func didTerminate(pid: pid_t, code: Int32) async {
+        guard process?.processIdentifier == pid else { return }
+        process?.terminationHandler = nil
+        process = nil
+        exitCode = code
+        await finishIO()
+        cleanupComplete = true
+    }
+
+    private func waitForExit(_ process: Process, timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while process.isRunning, clock.now < deadline {
+            try? await clock.sleep(for: .milliseconds(20))
+        }
+        return !process.isRunning
+    }
+
+    private func finishIO() async {
+        let stdoutTask = self.stdoutTask
+        let stderrTask = self.stderrTask
+        await stdoutTask?.value
+        await stderrTask?.value
+        closeHandles()
+        self.stdoutTask = nil
+        self.stderrTask = nil
+    }
+
+    private func forceCloseIO() {
+        stdoutTask?.cancel()
+        stderrTask?.cancel()
+        closeHandles()
+        stdoutTask = nil
+        stderrTask = nil
+        continuation.finish()
+    }
+
+    private func closeHandles() {
         try? inputHandle?.close()
         try? outputHandle?.close()
         try? errorHandle?.close()
         inputHandle = nil
         outputHandle = nil
         errorHandle = nil
-        process = nil
-        finishStream()
     }
 
-    private func consume(_ data: Data) {
-        guard !streamFinished else { return }
-        guard !data.isEmpty else {
-            finishStream()
-            return
+    private static func readStdout(
+        from handle: FileHandle,
+        continuation: AsyncStream<Data>.Continuation
+    ) async {
+        var buffer = Data()
+        do {
+            for try await byte in handle.bytes {
+                if byte == 0x0A {
+                    var line = buffer
+                    buffer.removeAll(keepingCapacity: true)
+                    if line.last == 0x0D {
+                        line.removeLast()
+                    }
+                    if !line.isEmpty {
+                        continuation.yield(line)
+                    }
+                } else {
+                    buffer.append(byte)
+                }
+            }
+        } catch {
+            // Closing a handle during forced cleanup ends the reader.
         }
 
-        buffer.append(data)
-        while let newline = buffer.firstIndex(of: 0x0A) {
-            var line = Data(buffer[..<newline])
-            buffer.removeSubrange(buffer.startIndex...newline)
-            if line.last == 0x0D {
-                line.removeLast()
-            }
-            if !line.isEmpty {
-                continuation.yield(line)
-            }
+        if buffer.last == 0x0D {
+            buffer.removeLast()
         }
-    }
-
-    private func didTerminate(code: Int32) {
-        outputHandle?.readabilityHandler = nil
-        errorHandle?.readabilityHandler = nil
-        process = nil
-        finishStream()
-    }
-
-    private func finishStream() {
-        guard !streamFinished else { return }
-        streamFinished = true
         if !buffer.isEmpty {
-            if buffer.last == 0x0D {
-                buffer.removeLast()
-            }
-            if !buffer.isEmpty {
-                continuation.yield(buffer)
-            }
-            buffer.removeAll(keepingCapacity: false)
+            continuation.yield(buffer)
         }
         continuation.finish()
+    }
+
+    private static func drainStderr(from handle: FileHandle) async {
+        do {
+            for try await _ in handle.bytes {}
+        } catch {
+            // stderr is intentionally ignored; closing the handle ends the drain.
+        }
     }
 }
