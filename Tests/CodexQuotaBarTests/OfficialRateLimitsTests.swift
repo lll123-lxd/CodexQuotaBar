@@ -41,4 +41,75 @@ final class OfficialRateLimitsTests: XCTestCase {
         XCTAssertEqual(merged.trackedFileCount, log.trackedFileCount)
         XCTAssertEqual(merged.trackedEventCount, log.trackedEventCount)
     }
+
+    func testApplyingPartialOfficialLimitsFallsBackToEachLogQuotaField() {
+        let now = Date(timeIntervalSince1970: 1_000)
+        let primaryResetAt = Date(timeIntervalSince1970: 2_000)
+        let secondaryResetAt = Date(timeIntervalSince1970: 3_000)
+        let log = CodexSnapshot(
+            refreshedAt: now,
+            latestEventAt: now.addingTimeInterval(-5),
+            modelName: "gpt-5",
+            planType: "plus",
+            primaryQuota: QuotaWindow(label: "log primary", windowMinutes: 240, usedPercent: 70, resetAt: primaryResetAt),
+            secondaryQuota: QuotaWindow(label: "log secondary", windowMinutes: 10_000, usedPercent: 60, resetAt: secondaryResetAt),
+            lastRequestTokens: totals(1),
+            latestSessionTotalTokens: totals(2),
+            fiveHourTokens: totals(3),
+            sevenDayTokens: totals(4),
+            todayTokens: totals(5),
+            yesterdayTokens: totals(6),
+            thirtyDayTokens: totals(7),
+            subscriptionCycleTokens: totals(8),
+            trackedFileCount: 9,
+            trackedEventCount: 10,
+            message: "log message"
+        )
+        let official = OfficialRateLimits(
+            primary: OfficialRateLimitWindow(usedPercent: nil, windowDurationMins: 300, resetsAt: 9_000),
+            secondary: OfficialRateLimitWindow(usedPercent: 14, windowDurationMins: nil, resetsAt: nil),
+            planType: nil
+        )
+        let refreshedAt = now.addingTimeInterval(10)
+
+        let merged = official.applying(to: log, at: refreshedAt)
+
+        XCTAssertEqual(merged.refreshedAt, refreshedAt)
+        XCTAssertEqual(merged.latestEventAt, refreshedAt)
+        XCTAssertEqual(merged.primaryQuota, QuotaWindow(
+            label: log.primaryQuota.label,
+            windowMinutes: 300,
+            usedPercent: log.primaryQuota.usedPercent,
+            resetAt: Date(timeIntervalSince1970: 9_000)
+        ))
+        XCTAssertEqual(merged.secondaryQuota, QuotaWindow(
+            label: log.secondaryQuota.label,
+            windowMinutes: log.secondaryQuota.windowMinutes,
+            usedPercent: 14,
+            resetAt: log.secondaryQuota.resetAt
+        ))
+        XCTAssertEqual(merged.modelName, log.modelName)
+        XCTAssertEqual(merged.planType, log.planType)
+        XCTAssertEqual(merged.lastRequestTokens, log.lastRequestTokens)
+        XCTAssertEqual(merged.latestSessionTotalTokens, log.latestSessionTotalTokens)
+        XCTAssertEqual(merged.fiveHourTokens, log.fiveHourTokens)
+        XCTAssertEqual(merged.sevenDayTokens, log.sevenDayTokens)
+        XCTAssertEqual(merged.todayTokens, log.todayTokens)
+        XCTAssertEqual(merged.yesterdayTokens, log.yesterdayTokens)
+        XCTAssertEqual(merged.thirtyDayTokens, log.thirtyDayTokens)
+        XCTAssertEqual(merged.subscriptionCycleTokens, log.subscriptionCycleTokens)
+        XCTAssertEqual(merged.trackedFileCount, log.trackedFileCount)
+        XCTAssertEqual(merged.trackedEventCount, log.trackedEventCount)
+        XCTAssertEqual(merged.message, log.message)
+    }
+
+    private func totals(_ seed: Int) -> TokenTotals {
+        TokenTotals(
+            inputTokens: seed,
+            cachedInputTokens: seed + 10,
+            outputTokens: seed + 20,
+            reasoningOutputTokens: seed + 30,
+            totalTokens: seed + 40
+        )
+    }
 }
