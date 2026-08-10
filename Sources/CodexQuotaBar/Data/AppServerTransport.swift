@@ -151,8 +151,9 @@ actor ProcessAppServerTransport: AppServerTransport {
             return
         }
 
-        let task = Task { [weak self] in
-            await self?.performStop()
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performStop()
         }
         shutdownTask = task
         await task.value
