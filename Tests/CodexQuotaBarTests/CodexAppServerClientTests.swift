@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import CodexQuotaBar
@@ -40,6 +41,176 @@ final class CodexAppServerClientTests: XCTestCase {
 
         XCTAssertNil(url)
     }
+
+    func testProcessTransportFramesStdoutAndDrainsStderr() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = try makeExecutableScript(
+            in: directory,
+            body: #"""
+            if [ "$#" -ne 1 ] || [ "$1" != "app-server" ]; then
+                exit 64
+            fi
+            IFS= read -r line
+            printf '{"stderr":true}\n' >&2
+            printf '%s\r\n\r\n' "$line"
+            printf '{"tail":true}'
+            """#
+        )
+        let transport = ProcessAppServerTransport(executableURL: executable)
+
+        let lines: [Data]
+        do {
+            try await transport.start()
+            try await transport.send(Data(#"{"stdin":true}"#.utf8))
+            lines = try await collectAllLines(from: transport.lines)
+        } catch {
+            await transport.stop()
+            throw error
+        }
+        await transport.stop()
+
+        XCTAssertEqual(lines.map { String(decoding: $0, as: UTF8.self) }, [
+            #"{"stdin":true}"#,
+            #"{"tail":true}"#,
+        ])
+    }
+
+    func testProcessTransportPreservesBurstFrameOrderThroughImmediateExit() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let executable = try makeExecutableScript(
+            in: directory,
+            body: #"""
+            i=0
+            while [ "$i" -lt 1000 ]; do
+                printf '{"number":%s}\n' "$i"
+                i=$((i + 1))
+            done
+            printf '{"tail":true}'
+            """#
+        )
+        let transport = ProcessAppServerTransport(executableURL: executable)
+
+        let lines: [Data]
+        do {
+            try await transport.start()
+            lines = try await collectAllLines(from: transport.lines)
+        } catch {
+            await transport.stop()
+            throw error
+        }
+        await transport.stop()
+
+        let expected = (0..<1000).map { #"{"number":\#($0)}"# } + [#"{"tail":true}"#]
+        XCTAssertEqual(lines.map { String(decoding: $0, as: UTF8.self) }, expected)
+    }
+
+    func testStopWaitsUntilProcessHasExited() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pidFile = directory.appendingPathComponent("process.pid")
+        let executable = try makeExecutableScript(
+            in: directory,
+            body: """
+            printf '%s' "$$" > \(shellQuote(pidFile.path))
+            trap 'sleep 1; exit 0' TERM
+            while :; do
+                sleep 1
+            done
+            """
+        )
+        let transport = ProcessAppServerTransport(executableURL: executable)
+
+        try await transport.start()
+        let pid: pid_t
+        do {
+            pid = try await waitForPID(at: pidFile)
+        } catch {
+            await transport.stop()
+            throw error
+        }
+        defer {
+            if Darwin.kill(pid, 0) == 0 {
+                _ = Darwin.kill(pid, SIGKILL)
+            }
+        }
+
+        await transport.stop()
+
+        if Darwin.kill(pid, 0) == 0 {
+            XCTFail("stop() returned while child process \(pid) was still alive")
+        } else {
+            XCTAssertEqual(errno, ESRCH)
+        }
+    }
+}
+
+private enum ProcessTransportTestError: Error {
+    case timedOut(String)
+    case invalidPID(String)
+}
+
+private func makeTemporaryDirectory() throws -> URL {
+    let directory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CodexQuotaBarTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    return directory
+}
+
+private func makeExecutableScript(in directory: URL, body: String) throws -> URL {
+    let executable = directory.appendingPathComponent("codex")
+    try "#!/bin/sh\nset -eu\n\(body)\n".write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+    return executable
+}
+
+private func collectAllLines(
+    from stream: AsyncStream<Data>,
+    timeout: Duration = .seconds(5)
+) async throws -> [Data] {
+    try await withThrowingTaskGroup(of: [Data].self) { group in
+        group.addTask {
+            var lines: [Data] = []
+            for await line in stream {
+                lines.append(line)
+            }
+            return lines
+        }
+        group.addTask {
+            try await ContinuousClock().sleep(for: timeout)
+            throw ProcessTransportTestError.timedOut("waiting for app-server stdout to finish")
+        }
+
+        defer { group.cancelAll() }
+        guard let result = try await group.next() else {
+            throw ProcessTransportTestError.timedOut("waiting for app-server stdout result")
+        }
+        return result
+    }
+}
+
+private func waitForPID(
+    at url: URL,
+    timeout: Duration = .seconds(5)
+) async throws -> pid_t {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if let contents = try? String(contentsOf: url, encoding: .utf8) {
+            let value = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let pid = pid_t(value), pid > 0 else {
+                throw ProcessTransportTestError.invalidPID(contents)
+            }
+            return pid
+        }
+        try await clock.sleep(for: .milliseconds(20))
+    }
+    throw ProcessTransportTestError.timedOut("waiting for app-server PID file")
+}
+
+private func shellQuote(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
 actor FakeAppServerTransport: AppServerTransport {
