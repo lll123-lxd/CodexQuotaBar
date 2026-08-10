@@ -45,7 +45,7 @@ enum AppPreferences {
 
     static let didChangeNotification = Notification.Name("CodexQuotaBarPreferencesDidChange")
     static let supportedRefreshIntervals: [Double] = [10, 20, 30, 60]
-    static let defaultRefreshInterval = 20.0
+    static let defaultRefreshInterval = 10.0
     static let defaultCurrencySymbol = "$"
 
     static func registerDefaults() {
