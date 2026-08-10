@@ -64,6 +64,8 @@ actor ProcessAppServerTransport: AppServerTransport {
     private var stdoutTask: Task<Void, Never>?
     private var stderrTask: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
+    private var stdoutFinished = true
+    private var stderrFinished = true
     private var started = false
     private var cleanupComplete = false
     private var exitCode: Int32?
@@ -125,11 +127,17 @@ actor ProcessAppServerTransport: AppServerTransport {
             throw error
         }
 
-        stdoutTask = Task { [continuation, outputHandle] in
+        stdoutFinished = false
+        stderrFinished = false
+        stdoutTask = Task<Void, Never> { [weak self, continuation, outputHandle] in
             await Self.readStdout(from: outputHandle, continuation: continuation)
+            guard let self else { return }
+            await self.markStdoutFinished()
         }
-        stderrTask = Task { [errorHandle] in
+        stderrTask = Task<Void, Never> { [weak self, errorHandle] in
             await Self.drainStderr(from: errorHandle)
+            guard let self else { return }
+            await self.markStderrFinished()
         }
     }
 
@@ -143,11 +151,11 @@ actor ProcessAppServerTransport: AppServerTransport {
     }
 
     func stop() async {
-        if cleanupComplete {
-            return
-        }
         if let shutdownTask {
             await shutdownTask.value
+            return
+        }
+        if cleanupComplete {
             return
         }
 
@@ -162,7 +170,7 @@ actor ProcessAppServerTransport: AppServerTransport {
     private func performStop() async {
         guard let process else {
             continuation.finish()
-            await finishIO()
+            await finishIOBounded()
             cleanupComplete = true
             return
         }
@@ -172,36 +180,39 @@ actor ProcessAppServerTransport: AppServerTransport {
             process.terminate()
         }
 
-        var exited = await waitForExit(process, timeout: .seconds(2))
-        if !exited, process.isRunning {
-            _ = Darwin.kill(pid, SIGKILL)
-            exited = await waitForExit(process, timeout: .seconds(2))
-        }
-        if !exited, process.isRunning {
-            _ = Darwin.kill(pid, SIGKILL)
-            exited = await waitForExit(process, timeout: .seconds(1))
+        let exitedGracefully = await waitForExit(process, timeout: .milliseconds(250))
+        if !exitedGracefully {
+            let signalResult = Darwin.kill(pid, SIGKILL)
+            let signalError = errno
+            if signalResult == 0 || signalError == ESRCH {
+                await Self.waitUntilExit(process)
+            } else {
+                process.terminate()
+                await Self.waitUntilExit(process)
+            }
         }
 
         process.terminationHandler = nil
         if self.process?.processIdentifier == pid {
             self.process = nil
         }
-        if exited {
-            exitCode = process.terminationStatus
-            await finishIO()
-        } else {
-            forceCloseIO()
-        }
+        exitCode = process.terminationStatus
+        await finishIOBounded()
         cleanupComplete = true
     }
 
-    private func didTerminate(pid: pid_t, code: Int32) async {
+    private func didTerminate(pid: pid_t, code: Int32) {
         guard process?.processIdentifier == pid else { return }
         process?.terminationHandler = nil
         process = nil
         exitCode = code
-        await finishIO()
-        cleanupComplete = true
+        guard shutdownTask == nil else { return }
+
+        let task = Task<Void, Never> { [weak self] in
+            guard let self else { return }
+            await self.performNaturalExitCleanup()
+        }
+        shutdownTask = task
     }
 
     private func waitForExit(_ process: Process, timeout: Duration) async -> Bool {
@@ -213,23 +224,47 @@ actor ProcessAppServerTransport: AppServerTransport {
         return !process.isRunning
     }
 
-    private func finishIO() async {
-        let stdoutTask = self.stdoutTask
-        let stderrTask = self.stderrTask
-        await stdoutTask?.value
-        await stderrTask?.value
+    private func performNaturalExitCleanup() async {
+        await finishIOBounded()
+        cleanupComplete = true
+    }
+
+    private func finishIOBounded() async {
+        let readersFinished = await waitForReaders(timeout: .milliseconds(250))
+        if !readersFinished {
+            stdoutTask?.cancel()
+            stderrTask?.cancel()
+            closeOutputHandles()
+            _ = await waitForReaders(timeout: .milliseconds(250))
+        }
+        continuation.finish()
         closeHandles()
         self.stdoutTask = nil
         self.stderrTask = nil
     }
 
-    private func forceCloseIO() {
-        stdoutTask?.cancel()
-        stderrTask?.cancel()
-        closeHandles()
-        stdoutTask = nil
-        stderrTask = nil
-        continuation.finish()
+    private func waitForReaders(timeout: Duration) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !(stdoutFinished && stderrFinished), clock.now < deadline {
+            try? await clock.sleep(for: .milliseconds(10))
+        }
+        return stdoutFinished && stderrFinished
+    }
+
+    private func markStdoutFinished() {
+        stdoutFinished = true
+    }
+
+    private func markStderrFinished() {
+        stderrFinished = true
+    }
+
+    private func closeOutputHandles() {
+        try? outputHandle?.close()
+        try? errorHandle?.close()
+        outputHandle = nil
+        errorHandle = nil
     }
 
     private func closeHandles() {
@@ -239,6 +274,12 @@ actor ProcessAppServerTransport: AppServerTransport {
         inputHandle = nil
         outputHandle = nil
         errorHandle = nil
+    }
+
+    private static func waitUntilExit(_ process: Process) async {
+        await Task.detached(priority: nil) {
+            process.waitUntilExit()
+        }.value
     }
 
     private static func readStdout(
