@@ -1,6 +1,8 @@
 .DS_Store
 /.build
 /dist
+/.worktrees
+/.superpowers
 /Packages
 xcuserdata/
 DerivedData/
