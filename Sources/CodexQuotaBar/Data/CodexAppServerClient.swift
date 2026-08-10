@@ -27,7 +27,7 @@ enum CodexAppServerClientError: LocalizedError, Equatable {
         case .malformedMessage:
             return "Codex app-server 返回了无效消息 (malformed message)"
         case let .rpc(code, message):
-            return "Codex app-server 错误 (code) (RPC error): (message)"
+            return "Codex app-server 错误 \(code) (RPC error): \(message)"
         case .disconnected:
             return "Codex app-server 连接已断开 (disconnected)"
         }
@@ -84,7 +84,7 @@ actor CodexAppServerClient: OfficialRateLimitClient {
 
     init(
         factory: AppServerTransportFactory = .live,
-        timeoutSeconds: TimeInterval = Self.requestTimeoutSeconds,
+        timeoutSeconds: TimeInterval = 20,
         sleep: @escaping ClientSleep = { seconds in
             let nanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
             try await Task.sleep(nanoseconds: nanoseconds)
