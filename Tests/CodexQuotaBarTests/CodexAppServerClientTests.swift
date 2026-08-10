@@ -332,6 +332,106 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(queue.makeCount, 2)
         try await stopClient(client)
     }
+
+    func testIdleConnectionEndReconnectsAndDeliversUpdatedNotifications() async throws {
+        let first = FakeAppServerTransport()
+        let second = FakeAppServerTransport()
+        let queue = LockedTransportQueue([first, second])
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { try queue.next() },
+            timeoutSeconds: 0.2,
+            sleep: { _ in },
+            jitter: { _ in 1 }
+        )
+        let read = Task { try await client.readRateLimits() }
+        let rateID = try await completeHandshakeAndReturnRateRequestID(first)
+        await first.emit("{\"id\":\(rateID),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
+        _ = try await taskValue(of: read)
+
+        await first.finish()
+        _ = try await waitForSentCount(1, transport: second)
+        let initialize = try jsonObject((await second.sent)[0])
+        await second.emit("{\"id\":\(try rpcID(initialize)),\"result\":{}}")
+        _ = try await waitForSentCount(2, transport: second)
+        await second.emit("{\"method\":\"account/rateLimits/updated\",\"params\":{}}")
+
+        XCTAssertTrue(try await waitForEvent(.rateLimitsChanged, in: client.events))
+        XCTAssertEqual(queue.makeCount, 2)
+        try await stopClient(client)
+    }
+
+    func testStopCancelsReadWaitingForReconnectBackoff() async throws {
+        let transport = FakeAppServerTransport()
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { transport },
+            timeoutSeconds: 0.2,
+            sleep: { _ in try await Task.sleep(for: .seconds(30)) },
+            jitter: { _ in 1 }
+        )
+        let read = Task { try await client.readRateLimits() }
+        let rateID = try await completeHandshakeAndReturnRateRequestID(transport)
+        await transport.emit("{\"id\":\(rateID),\"error\":{\"code\":-32001,\"message\":\"Server overloaded\"}}")
+
+        try await waitUntil { await transport.sent.count == 3 }
+        await client.stop()
+        do {
+            _ = try await taskValue(of: read, timeout: .seconds(1))
+            XCTFail("stopped read unexpectedly succeeded")
+        } catch is CancellationError {
+            // Expected: stop cancels the client-owned backoff task.
+        } catch let error as CodexAppServerClientError {
+            XCTAssertEqual(error, .stopped)
+        }
+    }
+
+    func testOldGenerationReadFailureDoesNotInvalidateNewConnection() async throws {
+        let first = FakeAppServerTransport()
+        let second = FakeAppServerTransport()
+        let queue = LockedTransportQueue([first, second])
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { try queue.next() },
+            timeoutSeconds: 0.2,
+            sleep: { _ in },
+            jitter: { _ in 1 }
+        )
+        await first.failNextSend()
+        await first.blockNextStop()
+
+        let firstRead = Task { try await client.readRateLimits() }
+        _ = try await waitForSentCount(1, transport: first)
+        try await waitUntil { await first.stopStarted }
+
+        let secondRead = Task { try await client.readRateLimits() }
+        _ = try await waitForSentCount(1, transport: second)
+        let initialize = try jsonObject((await second.sent)[0])
+        await second.emit("{\"id\":\(try rpcID(initialize)),\"result\":{}}")
+        _ = try await waitForSentCount(3, transport: second)
+
+        await first.releaseStop()
+        try await ContinuousClock().sleep(for: .milliseconds(50))
+        XCTAssertEqual(await second.stopCount, 0)
+        let rate = try jsonObject((await second.sent)[2])
+        await second.emit("{\"id\":\(try rpcID(rate)),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
+        _ = try await taskValue(of: secondRead)
+        firstRead.cancel()
+        _ = try? await taskValue(of: firstRead)
+        try await stopClient(client)
+    }
+
+    func testTaskValueTimeoutReturnsWhenExternalTaskIgnoresCancellation() async throws {
+        let suspension = UncancellableSuspension()
+        let task = Task<Int, Error> {
+            try await suspension.wait()
+        }
+        defer { Task { await suspension.resume() } }
+
+        do {
+            _ = try await taskValue(of: task, timeout: .milliseconds(20))
+            XCTFail("timeout unexpectedly returned a value")
+        } catch RPCClientTestError.timedOut {
+            XCTAssertTrue(task.isCancelled)
+        }
+    }
 }
 
 private enum ProcessTransportTestError: Error {
@@ -343,6 +443,40 @@ private enum RPCClientTestError: Error {
     case timedOut(String)
     case invalidRPCID
     case noTransportsRemaining
+}
+
+private final class TaskValueGate<Success>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Success, Error>?
+
+    func install(_ continuation: CheckedContinuation<Success, Error>) {
+        lock.lock()
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resume(with result: Result<Success, Error>) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+}
+
+private actor UncancellableSuspension {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async throws {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func resume() {
+        continuation?.resume()
+        continuation = nil
+    }
 }
 
 private final class LockedTransportQueue: @unchecked Sendable {
@@ -447,22 +581,25 @@ private func taskValue<Success: Sendable>(
     of task: Task<Success, Error>,
     timeout: Duration = .seconds(1)
 ) async throws -> Success {
-    do {
-        return try await withThrowingTaskGroup(of: Success.self) { group in
-            group.addTask { try await task.value }
-            group.addTask {
-                try await ContinuousClock().sleep(for: timeout)
-                throw RPCClientTestError.timedOut("waiting for RPC task")
+    let gate = TaskValueGate<Success>()
+    return try await withCheckedThrowingContinuation { continuation in
+        gate.install(continuation)
+        Task {
+            do {
+                gate.resume(with: .success(try await task.value))
+            } catch {
+                gate.resume(with: .failure(error))
             }
-            defer { group.cancelAll() }
-            guard let result = try await group.next() else {
-                throw RPCClientTestError.timedOut("waiting for RPC task result")
-            }
-            return result
         }
-    } catch {
-        task.cancel()
-        throw error
+        Task {
+            do {
+                try await ContinuousClock().sleep(for: timeout)
+                task.cancel()
+                gate.resume(with: .failure(RPCClientTestError.timedOut("waiting for RPC task")))
+            } catch {
+                // The timeout waiter has no caller-owned cancellation path.
+            }
+        }
     }
 }
 
@@ -620,6 +757,10 @@ actor FakeAppServerTransport: AppServerTransport {
     private(set) var sent: [Data] = []
     private(set) var startCount = 0
     private(set) var stopCount = 0
+    private var sendError: Error?
+    private var blocksStop = false
+    private var stopContinuation: CheckedContinuation<Void, Never>?
+    private(set) var stopStarted = false
 
     init() {
         var captured: AsyncStream<Data>.Continuation!
@@ -631,12 +772,22 @@ actor FakeAppServerTransport: AppServerTransport {
         startCount += 1
     }
 
-    func send(_ line: Data) async {
+    func send(_ line: Data) async throws {
+        if let sendError {
+            self.sendError = nil
+            throw sendError
+        }
         sent.append(line)
     }
 
     func stop() async {
         stopCount += 1
+        if blocksStop {
+            stopStarted = true
+            await withCheckedContinuation { continuation in
+                stopContinuation = continuation
+            }
+        }
         continuation.finish()
     }
 
@@ -646,5 +797,19 @@ actor FakeAppServerTransport: AppServerTransport {
 
     func finish() {
         continuation.finish()
+    }
+
+    func failNextSend() {
+        sendError = CodexAppServerClientError.disconnected
+    }
+
+    func blockNextStop() {
+        blocksStop = true
+    }
+
+    func releaseStop() {
+        stopContinuation?.resume()
+        stopContinuation = nil
+        blocksStop = false
     }
 }
