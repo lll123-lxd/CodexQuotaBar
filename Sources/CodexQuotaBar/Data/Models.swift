@@ -76,6 +76,30 @@ struct QuotaWindow: Equatable {
         return max(0, min(1, remainingPercent / 100))
     }
 
+    func compactResetRemaining(from now: Date, language: AppLanguage = .defaultLanguage) -> String {
+        guard let resetAt else {
+            return "--"
+        }
+
+        let seconds = Int(resetAt.timeIntervalSince(now))
+        guard seconds >= 60 else {
+            return language == .zhHans ? "即将重置" : "Resetting"
+        }
+
+        if seconds >= 86_400 {
+            let days = Int(ceil(Double(seconds) / 86_400))
+            return language == .zhHans ? "\(days)天" : "\(days)d"
+        }
+
+        if seconds >= 3_600 {
+            let hours = seconds / 3_600
+            return language == .zhHans ? "\(hours)小时" : "\(hours)h"
+        }
+
+        let minutes = seconds / 60
+        return language == .zhHans ? "\(minutes)分钟" : "\(minutes)m"
+    }
+
     var windowLabel: String {
         guard let windowMinutes else {
             return label
