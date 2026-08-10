@@ -234,7 +234,7 @@ final class CodexAppServerClientTests: XCTestCase {
         let rateID = try rpcID(rateRequest)
         await transport.emit("{\"id\":\(rateID),\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":20,\"windowDurationMins\":300,\"resetsAt\":2000},\"secondary\":{\"usedPercent\":14,\"windowDurationMins\":10080,\"resetsAt\":9000},\"planType\":\"plus\"}}}")
 
-        let limits = try await value(of: read)
+        let limits = try await taskValue(of: read)
         XCTAssertEqual(limits.secondary?.remainingFraction ?? -1, 0.86, accuracy: 0.000_001)
         let startCount = await transport.startCount
         XCTAssertEqual(startCount, 1)
@@ -279,7 +279,7 @@ final class CodexAppServerClientTests: XCTestCase {
         object = try jsonObject(sent[2])
         await second.emit("{\"id\":\(try rpcID(object)),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
 
-        _ = try await value(of: read)
+        _ = try await taskValue(of: read)
         XCTAssertEqual(delays.values, [1])
         XCTAssertEqual(queue.makeCount, 2)
         try await stopClient(client)
@@ -303,7 +303,7 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(secondRate["method"] as? String, "account/rateLimits/read")
         await transport.emit("{\"id\":\(try rpcID(secondRate)),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
 
-        _ = try await value(of: read)
+        _ = try await taskValue(of: read)
         XCTAssertEqual(delays.values, [1])
         let stopCount = await transport.stopCount
         XCTAssertEqual(stopCount, 0)
@@ -328,7 +328,7 @@ final class CodexAppServerClientTests: XCTestCase {
 
         let rateID = try await completeHandshakeAndReturnRateRequestID(second)
         await second.emit("{\"id\":\(rateID),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
-        _ = try await value(of: read)
+        _ = try await taskValue(of: read)
         XCTAssertEqual(queue.makeCount, 2)
         try await stopClient(client)
     }
@@ -443,7 +443,7 @@ private func completeHandshakeAndReturnRateRequestID(
     return try rpcID(object)
 }
 
-private func value<Success: Sendable>(
+private func taskValue<Success: Sendable>(
     of task: Task<Success, Error>,
     timeout: Duration = .seconds(1)
 ) async throws -> Success {
