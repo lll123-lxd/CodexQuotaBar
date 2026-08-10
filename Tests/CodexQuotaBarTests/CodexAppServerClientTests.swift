@@ -355,7 +355,8 @@ final class CodexAppServerClientTests: XCTestCase {
         _ = try await waitForSentCount(2, transport: second)
         await second.emit("{\"method\":\"account/rateLimits/updated\",\"params\":{}}")
 
-        XCTAssertTrue(try await waitForEvent(.rateLimitsChanged, in: client.events))
+        let received = try await waitForEvent(.rateLimitsChanged, in: client.events)
+        XCTAssertTrue(received)
         XCTAssertEqual(queue.makeCount, 2)
         try await stopClient(client)
     }
@@ -426,6 +427,7 @@ final class CodexAppServerClientTests: XCTestCase {
         let suspension = UncancellableSuspension()
         let task = Task<Int, Error> {
             try await suspension.wait()
+            return 1
         }
         defer { Task { await suspension.resume() } }
 
