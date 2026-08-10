@@ -361,6 +361,33 @@ final class CodexAppServerClientTests: XCTestCase {
         try await stopClient(client)
     }
 
+    func testReconnectSupervisorRestartsWhenReplacementEndsBeforeItReturns() async throws {
+        let first = FakeAppServerTransport()
+        let second = FakeAppServerTransport()
+        let third = FakeAppServerTransport()
+        let queue = LockedTransportQueue([first, second, third])
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { try queue.next() },
+            timeoutSeconds: 0.2,
+            sleep: { _ in },
+            jitter: { _ in 1 }
+        )
+        let read = Task { try await client.readRateLimits() }
+        let rateID = try await completeHandshakeAndReturnRateRequestID(first)
+        await first.emit("{\"id\":\(rateID),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
+        _ = try await taskValue(of: read)
+
+        await second.finishOnInitializedNotification()
+        await first.finish()
+        _ = try await waitForSentCount(1, transport: second)
+        let initialize = try jsonObject((await second.sent)[0])
+        await second.emit("{\"id\":\(try rpcID(initialize)),\"result\":{}}")
+
+        _ = try await waitForSentCount(1, transport: third)
+        XCTAssertEqual(queue.makeCount, 3)
+        try await stopClient(client)
+    }
+
     func testStopCancelsReadWaitingForReconnectBackoff() async throws {
         let transport = FakeAppServerTransport()
         let client = CodexAppServerClient(
@@ -403,6 +430,41 @@ final class CodexAppServerClientTests: XCTestCase {
         await first.emit("{\"id\":\(try rpcID(firstInitialize)),\"result\":{}}")
         _ = try await waitForSentCount(2, transport: first)
         await first.failNextSend()
+        try await waitUntil { await first.stopStarted }
+
+        let secondRead = Task { try await client.readRateLimits() }
+        _ = try await waitForSentCount(1, transport: second)
+        let initialize = try jsonObject((await second.sent)[0])
+        await second.emit("{\"id\":\(try rpcID(initialize)),\"result\":{}}")
+        _ = try await waitForSentCount(3, transport: second)
+
+        await first.releaseStop()
+        try await ContinuousClock().sleep(for: .milliseconds(50))
+        let secondStopCount = await second.stopCount
+        XCTAssertEqual(secondStopCount, 0)
+        let rate = try jsonObject((await second.sent)[2])
+        await second.emit("{\"id\":\(try rpcID(rate)),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
+        _ = try await taskValue(of: secondRead)
+        firstRead.cancel()
+        _ = try? await taskValue(of: firstRead)
+        try await stopClient(client)
+    }
+
+    func testFailedConnectionWithoutRequestGenerationDoesNotInvalidateNewConnection() async throws {
+        let first = FakeAppServerTransport()
+        let second = FakeAppServerTransport()
+        let queue = LockedTransportQueue([first, second])
+        let client = CodexAppServerClient(
+            factory: AppServerTransportFactory { try queue.next() },
+            timeoutSeconds: 0.2,
+            sleep: { _ in },
+            jitter: { _ in 1 }
+        )
+        await first.failNextSend()
+        await first.blockNextStop()
+
+        let firstRead = Task { try await client.readRateLimits() }
+        _ = try await waitForSentCount(1, transport: first)
         try await waitUntil { await first.stopStarted }
 
         let secondRead = Task { try await client.readRateLimits() }
@@ -773,7 +835,9 @@ actor FakeAppServerTransport: AppServerTransport {
     private(set) var stopCount = 0
     private var sendError: Error?
     private var blocksStop = false
+    private var finishesOnInitializedNotification = false
     private var stopContinuation: CheckedContinuation<Void, Never>?
+    private var sendContinuation: CheckedContinuation<Void, Never>?
     private(set) var stopStarted = false
 
     init() {
@@ -792,10 +856,20 @@ actor FakeAppServerTransport: AppServerTransport {
             throw sendError
         }
         sent.append(line)
+        if finishesOnInitializedNotification,
+           let object = try? jsonObject(line),
+           object["method"] as? String == "initialized" {
+            continuation.finish()
+            await withCheckedContinuation { continuation in
+                sendContinuation = continuation
+            }
+        }
     }
 
     func stop() async {
         stopCount += 1
+        sendContinuation?.resume()
+        sendContinuation = nil
         if blocksStop {
             stopStarted = true
             await withCheckedContinuation { continuation in
@@ -819,6 +893,10 @@ actor FakeAppServerTransport: AppServerTransport {
 
     func blockNextStop() {
         blocksStop = true
+    }
+
+    func finishOnInitializedNotification() {
+        finishesOnInitializedNotification = true
     }
 
     func releaseStop() {
