@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct SettingsView: View {
@@ -167,6 +168,9 @@ struct SettingsView: View {
         .padding(20)
         .frame(width: 500, height: 660)
         .onAppear {
+            loginItemController.refresh()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             loginItemController.refresh()
         }
         .onChange(of: refreshInterval) { _ in
