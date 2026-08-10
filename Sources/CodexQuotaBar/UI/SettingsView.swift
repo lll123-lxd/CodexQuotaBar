@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage(AppPreferences.Keys.tokenCachedInputCostPerMillion) private var tokenCachedInputCostPerMillion = 0.0
     @AppStorage(AppPreferences.Keys.tokenOutputCostPerMillion) private var tokenOutputCostPerMillion = 0.0
     @State private var monitorTargets = AppPreferences.monitorTargets
+    @StateObject private var loginItemController = LoginItemController()
 
     let onCloseOtherInstances: () -> Void
     let onOpenLogs: () -> Void
@@ -28,6 +29,13 @@ struct SettingsView: View {
         Binding(
             get: { Date(timeIntervalSince1970: subscriptionStartAt) },
             set: { subscriptionStartAt = $0.timeIntervalSince1970 }
+        )
+    }
+
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: { loginItemController.isEnabled },
+            set: { loginItemController.setEnabled($0) }
         )
     }
 
@@ -125,6 +133,24 @@ struct SettingsView: View {
             }
 
             Section(text.behaviorSectionTitle) {
+                Toggle(text.launchAtLoginLabel, isOn: launchAtLoginBinding)
+
+                Text(text.launchAtLoginExplanation)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                if loginItemController.requiresApproval {
+                    Text(text.loginItemRequiresApprovalExplanation)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let error = loginItemController.errorMessage {
+                    Text(error)
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                }
+
                 Toggle(text.autoCloseOtherInstancesLabel, isOn: $autoCloseOtherInstances)
 
                 Text(text.autoCloseExplanation)
@@ -140,6 +166,9 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(20)
         .frame(width: 500, height: 660)
+        .onAppear {
+            loginItemController.refresh()
+        }
         .onChange(of: refreshInterval) { _ in
             AppPreferences.notifyDidChange()
         }

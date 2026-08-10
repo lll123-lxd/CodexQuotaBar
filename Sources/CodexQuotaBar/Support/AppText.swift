@@ -439,6 +439,27 @@ struct AppText {
         }
     }
 
+    var launchAtLoginLabel: String {
+        switch language {
+        case .zhHans: "开机启动"
+        case .english: "Launch at Login"
+        }
+    }
+
+    var launchAtLoginExplanation: String {
+        switch language {
+        case .zhHans: "登录 macOS 后自动启动 CodexQuotaBar。默认关闭。"
+        case .english: "Start CodexQuotaBar automatically after signing in to macOS. Off by default."
+        }
+    }
+
+    var loginItemRequiresApprovalExplanation: String {
+        switch language {
+        case .zhHans: "请在“系统设置 → 通用 → 登录项”中批准 CodexQuotaBar。"
+        case .english: "Approve CodexQuotaBar in System Settings → General → Login Items."
+        }
+    }
+
     var autoCloseOtherInstancesLabel: String {
         switch language {
         case .zhHans: "启动时自动关闭其他实例"
