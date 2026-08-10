@@ -9,6 +9,7 @@ final class CodexUsageStore: ObservableObject {
 
     @Published private(set) var monitorSnapshots: [MonitorSnapshot] = []
     @Published private(set) var connectionState: QuotaConnectionState = .logs
+    private var rawMonitorSnapshots: [MonitorSnapshot] = []
 
     var snapshot: CodexSnapshot {
         monitorSnapshots.first?.snapshot ?? .empty
@@ -29,6 +30,7 @@ final class CodexUsageStore: ObservableObject {
     private var logRefreshPending = false
     private var officialRefreshPending = false
     private var isRunning = false
+    private var isStopped = false
     private var preferencesObserver: AnyCancellable?
 
     init(
@@ -53,7 +55,7 @@ final class CodexUsageStore: ObservableObject {
     }
 
     func start() {
-        guard !isRunning else { return }
+        guard !isRunning, !isStopped else { return }
         isRunning = true
         preferencesObserver = NotificationCenter.default.publisher(for: AppPreferences.didChangeNotification)
             .sink { [weak self] _ in
@@ -74,7 +76,9 @@ final class CodexUsageStore: ObservableObject {
     }
 
     func stop() {
+        guard isRunning else { return }
         isRunning = false
+        isStopped = true
         logRefreshPending = false
         officialRefreshPending = false
         logRefreshTask?.cancel()
@@ -123,7 +127,8 @@ final class CodexUsageStore: ObservableObject {
             logRefreshPending = false
             return
         }
-        monitorSnapshots = snapshots.map(applyingLatestOfficial)
+        rawMonitorSnapshots = snapshots
+        monitorSnapshots = rawMonitorSnapshots.map(applyingLatestOfficial)
         isLogRefreshing = false
         if logRefreshPending {
             logRefreshPending = false
@@ -144,6 +149,7 @@ final class CodexUsageStore: ObservableObject {
     }
 
     private func handle(_ event: CodexAppServerEvent) {
+        guard isRunning else { return }
         switch event {
         case let .stateChanged(state):
             connectionState = state
@@ -176,20 +182,16 @@ final class CodexUsageStore: ObservableObject {
     }
 
     private func receiveOfficial(_ limits: OfficialRateLimits) {
+        guard isRunning else { return }
         let fetchedAt = now()
         latestOfficial = limits
         latestOfficialAt = fetchedAt
         connectionState = .live(updatedAt: fetchedAt)
-        monitorSnapshots = monitorSnapshots.map { monitor in
-            guard monitor.target.id == "default-codex" else { return monitor }
-            return MonitorSnapshot(
-                target: monitor.target,
-                snapshot: limits.applying(to: monitor.snapshot, at: fetchedAt)
-            )
-        }
+        monitorSnapshots = rawMonitorSnapshots.map(applyingLatestOfficial)
     }
 
     private func receiveOfficialFailure(_ error: Error) {
+        guard isRunning else { return }
         if latestOfficial == nil {
             connectionState = .logs
         } else {
