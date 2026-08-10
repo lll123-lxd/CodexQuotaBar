@@ -104,12 +104,13 @@ final class CodexUsageStoreTests: XCTestCase {
     }
 
     func testReconnectKeepsLastOfficialValue() async throws {
+        let now = fixedNow
         let client = FakeOfficialRateLimitClient()
         let store = makeStore(client: client, targets: [makeTarget(id: "default-codex")])
         store.start()
         try await waitUntil { await client.readCount == 1 && store.monitorSnapshots.count == 1 }
         await client.succeed(officialLimits())
-        try await waitUntil { store.connectionState == .live(updatedAt: fixedNow) }
+        try await waitUntil { store.connectionState == .live(updatedAt: now) }
 
         await client.emit(.stateChanged(.reconnecting(attempt: 1, message: "test")))
 
@@ -122,12 +123,13 @@ final class CodexUsageStoreTests: XCTestCase {
     }
 
     func testUpdatedNotificationTriggersOneFullRead() async throws {
+        let now = fixedNow
         let client = FakeOfficialRateLimitClient()
         let store = makeStore(client: client, targets: [makeTarget(id: "default-codex")])
         store.start()
         try await waitUntil { await client.readCount == 1 }
         await client.succeed(OfficialRateLimits(primary: nil, secondary: nil, planType: nil))
-        try await waitUntil { store.connectionState == .live(updatedAt: fixedNow) }
+        try await waitUntil { store.connectionState == .live(updatedAt: now) }
 
         await client.emit(.rateLimitsChanged)
 
@@ -155,7 +157,7 @@ final class CodexUsageStoreTests: XCTestCase {
         targets: [MonitorTarget]
     ) -> CodexUsageStore {
         let now = fixedNow
-        CodexUsageStore(
+        return CodexUsageStore(
             officialClient: client,
             snapshotLoader: { _, date in
                 SnapshotFixtures.make(
