@@ -82,8 +82,15 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
     private func bindStore() {
         store.$monitorSnapshots
             .receive(on: RunLoop.main)
-            .sink { [weak self] snapshots in
-                self?.updateStatusItem(with: self?.representativeStatusMonitor(from: snapshots))
+            .sink { [weak self] _ in
+                self?.refreshStatusItemFromStore()
+            }
+            .store(in: &cancellables)
+
+        store.$connectionState
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshStatusItemFromStore()
             }
             .store(in: &cancellables)
 
@@ -93,6 +100,10 @@ final class AppCoordinator: NSObject, NSMenuDelegate {
                 self?.applyLocalizedChrome()
             }
             .store(in: &cancellables)
+    }
+
+    private func refreshStatusItemFromStore() {
+        updateStatusItem(with: representativeStatusMonitor(from: store.monitorSnapshots))
     }
 
     private func updateStatusItem(with monitor: MonitorSnapshot?) {
