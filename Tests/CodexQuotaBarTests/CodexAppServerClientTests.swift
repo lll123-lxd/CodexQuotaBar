@@ -451,7 +451,7 @@ private enum RPCClientTestError: Error {
     case noTransportsRemaining
 }
 
-private final class TaskValueGate<Success>: @unchecked Sendable {
+private final class TaskValueGate<Success: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Success, Error>?
 
@@ -461,12 +461,20 @@ private final class TaskValueGate<Success>: @unchecked Sendable {
         lock.unlock()
     }
 
-    func resume(with result: Result<Success, Error>) {
+    func resume(returning value: sending Success) {
         lock.lock()
         let continuation = self.continuation
         self.continuation = nil
         lock.unlock()
-        continuation?.resume(with: result)
+        continuation?.resume(returning: value)
+    }
+
+    func resume(throwing error: sending any Error) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: error)
     }
 }
 
@@ -592,16 +600,16 @@ private func taskValue<Success: Sendable>(
         gate.install(continuation)
         Task {
             do {
-                gate.resume(with: .success(try await task.value))
+                gate.resume(returning: try await task.value)
             } catch {
-                gate.resume(with: .failure(error))
+                gate.resume(throwing: error)
             }
         }
         Task {
             do {
                 try await ContinuousClock().sleep(for: timeout)
                 task.cancel()
-                gate.resume(with: .failure(RPCClientTestError.timedOut("waiting for RPC task")))
+                gate.resume(throwing: RPCClientTestError.timedOut("waiting for RPC task"))
             } catch {
                 // The timeout waiter has no caller-owned cancellation path.
             }
