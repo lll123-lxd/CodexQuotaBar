@@ -144,6 +144,67 @@ final class CodexAppServerClientTests: XCTestCase {
             XCTAssertEqual(errno, ESRCH)
         }
     }
+
+    func testConcurrentStopsForceAnIgnoredTermProcessWithinBound() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pidFile = directory.appendingPathComponent("ignored-term.pid")
+        let executable = try makeExecutableScript(
+            in: directory,
+            body: """
+            printf '%s' "$$" > \(shellQuote(pidFile.path))
+            trap '' TERM
+            while :; do
+                IFS= read -r ignored
+            done
+            """
+        )
+        let transport = ProcessAppServerTransport(executableURL: executable)
+
+        try await transport.start()
+        let pid = try await waitForPID(at: pidFile)
+        defer { killIfAlive(pid) }
+        let startedAt = Date()
+        let first = Task<Void, Never> { await transport.stop() }
+        let second = Task<Void, Never> { await transport.stop() }
+
+        try await waitForTasks([first, second], timeout: .seconds(6))
+
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1.5)
+        assertProcessDoesNotExist(pid)
+    }
+
+    func testStopDoesNotWaitForDescendantHoldingPipesOpen() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let parentPIDFile = directory.appendingPathComponent("parent.pid")
+        let descendantPIDFile = directory.appendingPathComponent("descendant.pid")
+        let executable = try makeExecutableScript(
+            in: directory,
+            body: """
+            /bin/sleep 3 &
+            descendant=$!
+            printf '%s' "$$" > \(shellQuote(parentPIDFile.path))
+            printf '%s' "$descendant" > \(shellQuote(descendantPIDFile.path))
+            exit 0
+            """
+        )
+        let transport = ProcessAppServerTransport(executableURL: executable)
+
+        try await transport.start()
+        let parentPID = try await waitForPID(at: parentPIDFile)
+        let descendantPID = try await waitForPID(at: descendantPIDFile)
+        defer { killIfAlive(parentPID) }
+        defer { killIfAlive(descendantPID) }
+        XCTAssertEqual(Darwin.kill(descendantPID, 0), 0)
+        let startedAt = Date()
+        let stop = Task<Void, Never> { await transport.stop() }
+
+        try await waitForTasks([stop], timeout: .seconds(5))
+
+        XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1.5)
+        assertProcessDoesNotExist(parentPID)
+    }
 }
 
 private enum ProcessTransportTestError: Error {
@@ -211,6 +272,61 @@ private func waitForPID(
 
 private func shellQuote(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+private actor TaskCompletionFlag {
+    private var completed = false
+
+    func markCompleted() {
+        completed = true
+    }
+
+    func isCompleted() -> Bool {
+        completed
+    }
+}
+
+private func waitForTasks(
+    _ tasks: [Task<Void, Never>],
+    timeout: Duration
+) async throws {
+    let completion = TaskCompletionFlag()
+    let observer = Task<Void, Never> {
+        for task in tasks {
+            await task.value
+        }
+        await completion.markCompleted()
+    }
+    defer { observer.cancel() }
+
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while clock.now < deadline {
+        if await completion.isCompleted() {
+            return
+        }
+        try await clock.sleep(for: .milliseconds(20))
+    }
+    tasks.forEach { $0.cancel() }
+    throw ProcessTransportTestError.timedOut("waiting for transport stop tasks")
+}
+
+private func killIfAlive(_ pid: pid_t) {
+    if Darwin.kill(pid, 0) == 0 {
+        _ = Darwin.kill(pid, SIGKILL)
+    }
+}
+
+private func assertProcessDoesNotExist(
+    _ pid: pid_t,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    if Darwin.kill(pid, 0) == 0 {
+        XCTFail("process \(pid) is still alive", file: file, line: line)
+    } else {
+        XCTAssertEqual(errno, ESRCH, file: file, line: line)
+    }
 }
 
 actor FakeAppServerTransport: AppServerTransport {
