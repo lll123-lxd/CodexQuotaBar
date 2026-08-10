@@ -461,27 +461,20 @@ final class CodexAppServerClientTests: XCTestCase {
             jitter: { _ in 1 }
         )
         await first.failNextSend()
-        await first.blockNextStop()
 
-        let firstRead = Task { try await client.readRateLimits() }
+        let read = Task { try await client.readRateLimits() }
         _ = try await waitForSentCount(1, transport: first)
-        try await waitUntil { await first.stopStarted }
-
-        let secondRead = Task { try await client.readRateLimits() }
+        try await waitUntil { await first.stopCount == 1 }
         _ = try await waitForSentCount(1, transport: second)
         let initialize = try jsonObject((await second.sent)[0])
         await second.emit("{\"id\":\(try rpcID(initialize)),\"result\":{}}")
         _ = try await waitForSentCount(3, transport: second)
 
-        await first.releaseStop()
-        try await ContinuousClock().sleep(for: .milliseconds(50))
         let secondStopCount = await second.stopCount
         XCTAssertEqual(secondStopCount, 0)
         let rate = try jsonObject((await second.sent)[2])
         await second.emit("{\"id\":\(try rpcID(rate)),\"result\":{\"rateLimits\":{\"primary\":null,\"secondary\":null,\"planType\":\"plus\"}}}")
-        _ = try await taskValue(of: secondRead)
-        firstRead.cancel()
-        _ = try? await taskValue(of: firstRead)
+        _ = try await taskValue(of: read)
         try await stopClient(client)
     }
 

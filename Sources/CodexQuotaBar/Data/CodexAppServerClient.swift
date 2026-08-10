@@ -173,11 +173,18 @@ actor CodexAppServerClient: OfficialRateLimitClient {
     }
 
     private func waitForReconnectBackoff(_ delay: TimeInterval) async throws {
+        guard !stopped else {
+            throw CodexAppServerClientError.stopped
+        }
         let identifier = UUID()
         let sleeper = sleep
         let task = Task { try await sleeper(delay) }
         backoffTasks[identifier] = task
         defer { backoffTasks[identifier] = nil }
+        guard !stopped else {
+            task.cancel()
+            throw CodexAppServerClientError.stopped
+        }
         try await task.value
     }
 
