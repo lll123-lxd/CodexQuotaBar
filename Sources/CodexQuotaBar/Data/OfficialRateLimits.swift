@@ -15,8 +15,8 @@ struct OfficialRateLimits: Decodable, Equatable {
             latestEventAt: refreshedAt,
             modelName: log.modelName,
             planType: planType ?? log.planType,
-            primaryQuota: primary?.quota(label: "5h quota", fallbackMinutes: 300) ?? log.primaryQuota,
-            secondaryQuota: secondary?.quota(label: "7d quota", fallbackMinutes: 10_080) ?? log.secondaryQuota,
+            primaryQuota: primary?.applying(to: log.primaryQuota) ?? log.primaryQuota,
+            secondaryQuota: secondary?.applying(to: log.secondaryQuota) ?? log.secondaryQuota,
             lastRequestTokens: log.lastRequestTokens,
             latestSessionTotalTokens: log.latestSessionTotalTokens,
             fiveHourTokens: log.fiveHourTokens,
@@ -43,6 +43,15 @@ struct OfficialRateLimitWindow: Decodable, Equatable {
 
     var resetAt: Date? {
         resetsAt.map(Date.init(timeIntervalSince1970:))
+    }
+
+    func applying(to fallback: QuotaWindow) -> QuotaWindow {
+        QuotaWindow(
+            label: fallback.label,
+            windowMinutes: windowDurationMins ?? fallback.windowMinutes,
+            usedPercent: usedPercent ?? fallback.usedPercent,
+            resetAt: resetAt ?? fallback.resetAt
+        )
     }
 
     func quota(label: String, fallbackMinutes: Int) -> QuotaWindow {
